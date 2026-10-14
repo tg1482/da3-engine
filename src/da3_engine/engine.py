@@ -2,18 +2,15 @@
 
     eng = Engine("depth-anything/DA3-SMALL", backend="mlx")      # or backend="torch"
     v = eng.view(rgb)                                             # once per image: preprocess + per-view blocks
+    r = eng.infer([v0, v1, ..., v5], depth=[5], rays=[], ray_pose=False)   # DA3's outputs for these views
 
-    # exact (the same outputs as DA3 for these views)
-    r = eng.infer([v0, v1, ..., v5], depth=[5], rays=[], ray_pose=False)
+Result: w2c (S x 3 x 4) and K (S x 3 x 3) from the camera head for every view; per requested view: depth,
+depth_conf (H x W), ray (h x w x 6: direction, origin), ray_conf; ray_w2c / ray_K from the rays when ray_pose (DA3's
+use_ray_pose solver).
 
-    # streaming with a K/V cache: run a set of views once and keep their keys/values; each new view then attends
-    # to them instead of re-running all of them (they don't see the new view: an approximation, measured in tests)
-    ctx, r = eng.context([v0, ..., v4], depth=[4])
-    r = eng.extend(ctx, v5, depth=True, rays=True, ray_pose=True)
-
-Result: w2c (S x 3 x 4) and K (S x 3 x 3) from the camera head for every view in the step (for extend: the context's
-views then the new one, all in the context's frame); per requested view: depth, depth_conf (H x W), ray (h x w x 6:
-direction, origin), ray_conf; ray_w2c / ray_K from the rays when ray_pose (DA3's use_ray_pose solver).
+No K/V cache across steps: DA3's cross-view attention is bidirectional, so a kept view's keys and values change
+whenever another view joins. Freezing them (tried 10-14) kept rotation but put translation direction off ~18 deg and
+doubled SLAM error; reusing them exactly would need a causally trained model.
 """
 from __future__ import annotations
 
@@ -41,15 +38,6 @@ class Result:
     ray_conf: dict = field(default_factory=dict)
     ray_w2c: dict = field(default_factory=dict)
     ray_K: dict = field(default_factory=dict)
-
-
-@dataclass(frozen=True)
-class Context:
-    """A K/V cache: views run together once, with every cross-view block's keys and values kept."""
-    kvs: dict
-    enc: np.ndarray                 # camera-head pose encodings of the context's views (S x 9)
-    hw: tuple
-    size: int
 
 
 def default_weights_dir(model: str) -> str:
@@ -98,30 +86,9 @@ class Engine:
                 r.ray_w2c[i], r.ray_K[i] = w2c[j], K[j]
 
     def infer(self, views: list, depth=(), rays=(), ray_pose: bool = False) -> Result:
-        return self._run(views, depth, rays, ray_pose, keep_kv=False)[1]
-
-    def context(self, views: list, depth=(), rays=(), ray_pose: bool = False):
-        """infer, keeping the cross-view keys/values: (Context, Result)."""
-        return self._run(views, depth, rays, ray_pose, keep_kv=True)
-
-    def _run(self, views, depth, rays, ray_pose, keep_kv):
         H, W = views[0].hw
-        outs, kvs = self.b.cross([v.tokens for v in views], keep_kv)
-        enc = self.b.pose_enc(outs)
-        w2c, K = pose_to_w2c_K(enc, H, W)
+        outs = self.b.cross([v.tokens for v in views])
+        w2c, K = pose_to_w2c_K(self.b.pose_enc(outs), H, W)
         r = Result(w2c, K)
         self._heads(r, outs, list(range(len(views))), H, W, set(depth), set(rays), ray_pose)
-        return (Context(kvs, enc, (H, W), len(views)) if keep_kv else None), r
-
-    def extend(self, ctx: Context, view: View, depth: bool = True, rays: bool = False,
-               ray_pose: bool = False) -> Result:
-        """One new view against a context: its outputs, and every camera in the context's frame (new view last)."""
-        H, W = ctx.hw
-        assert view.hw == ctx.hw, "a context and its new views share one input size"
-        outs = self.b.extend(ctx.kvs, view.tokens)
-        enc = np.concatenate([ctx.enc, self.b.pose_enc(outs)], 0)
-        w2c, K = pose_to_w2c_K(enc, H, W)
-        r = Result(w2c, K)
-        n = ctx.size
-        self._heads(r, outs, [n], H, W, {n} if depth else set(), {n} if rays else set(), ray_pose)
         return r

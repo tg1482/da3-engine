@@ -91,7 +91,7 @@ class TorchBackend:
         v, w = t[..., :h], t[..., h:]
         return torch.cat([v * cy + rot(v) * sy, w * cx + rot(w) * sx], -1)
 
-    def _block(self, blk, x, tabs=None, past=None):
+    def _block(self, blk, x, tabs=None):
         a = blk.attn
         b, n, c = x.shape
         h = a.num_heads
@@ -99,12 +99,9 @@ class TorchBackend:
         q, k, v = a.q_norm(qkv[0]), a.k_norm(qkv[1]), qkv[2]
         if tabs is not None:
             q, k = self._rope_apply(q, tabs), self._rope_apply(k, tabs)
-        kv = (k, v)
-        if past is not None:
-            k, v = torch.cat([past[0], k], 2), torch.cat([past[1], v], 2)
         o = F.scaled_dot_product_attention(q, k, v)
         x = x + blk.ls1(a.proj(o.transpose(1, 2).reshape(b, n, c)))
-        return x + blk.ls2(blk.mlp(blk.norm2(x))), kv
+        return x + blk.ls2(blk.mlp(blk.norm2(x)))
 
     def early(self, img: np.ndarray) -> dict:
         x = torch.from_numpy(img).to(self.dev, self.dtype).permute(2, 0, 1)[None]
@@ -113,9 +110,9 @@ class TorchBackend:
         x = torch.cat([self.vit.cls_token.to(x.dtype), x], 1) + self._pos_table(ph, pw)
         a = self.vit.alt_start
         for blk in self.vit.blocks[:a - 1]:
-            x, _ = self._block(blk, x)
+            x = self._block(blk, x)
         before = x
-        x, _ = self._block(self.vit.blocks[a - 1], x)
+        x = self._block(self.vit.blocks[a - 1], x)
         return {"before": before, "x": x, "grid": (ph, pw)}
 
     def _out(self, local_x, x):
@@ -123,7 +120,7 @@ class TorchBackend:
         o = torch.cat([local_x, x], -1)
         return torch.cat([o[..., :c], self.vit.norm(o[..., c:])], -1)[:, 1:], o[:, 0]
 
-    def cross(self, views: list, keep_kv: bool):
+    def cross(self, views: list):
         vit = self.vit
         S = len(views)
         ph, pw = views[0]["grid"]
@@ -137,7 +134,7 @@ class TorchBackend:
         inv = [order.index(j) for j in range(S)]
         local_x = x
         T = x.shape[1]
-        outs, kvs = [], {}
+        outs = []
         for i in range(vit.alt_start, len(vit.blocks)):
             blk = vit.blocks[i]
             ltabs, gtabs = self._tabs(i, ph, pw, S)
@@ -146,48 +143,19 @@ class TorchBackend:
                 x = torch.cat([cam[0][:, None].to(x.dtype), x[:, 1:]], 1)
                 local_x = x
             if i % 2 == 1:
-                y, kv = self._block(blk, x.reshape(1, S * T, -1), gtabs)
-                x = y.reshape(S, T, -1)
-                if keep_kv:
-                    kvs[i] = kv
+                x = self._block(blk, x.reshape(1, S * T, -1), gtabs).reshape(S, T, -1)
             else:
-                x, _ = self._block(blk, x, ltabs)
+                x = self._block(blk, x, ltabs)
                 local_x = x
             if i in self.out_layers:
                 tok, cam = self._out(local_x, x)
                 outs.append((tok[inv], cam[inv]))
-        return outs, kvs
-
-    def extend(self, kvs: dict, view: dict):
-        vit = self.vit
-        ph, pw = view["grid"]
-        x = view["x"]
-        local_x = x
-        outs = []
-        for i in range(vit.alt_start, len(vit.blocks)):
-            blk = vit.blocks[i]
-            ltabs, gtabs = self._tabs(i, ph, pw, 1)
-            if i == vit.alt_start:
-                x = torch.cat([vit.camera_token[:, 1:].to(x.dtype), x[:, 1:]], 1)
-                local_x = x
-            if i % 2 == 1:
-                x, _ = self._block(blk, x, gtabs, past=kvs[i])
-            else:
-                x, _ = self._block(blk, x, ltabs)
-                local_x = x
-            if i in self.out_layers:
-                outs.append(self._out(local_x, x))
         return outs
 
     @staticmethod
     def select(outs, idx):
         idx = list(idx)
         return [(t[idx], c[idx]) for t, c in outs]
-
-    @staticmethod
-    def concat(parts):
-        return [(torch.cat([p[i][0] for p in parts], 0), torch.cat([p[i][1] for p in parts], 0))
-                for i in range(len(parts[0]))]
 
     # ------------------------------------------------------------------------------------------------------- heads
 

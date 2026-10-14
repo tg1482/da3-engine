@@ -101,8 +101,7 @@ class Attention(nn.Module):
             self.q_norm = nn.LayerNorm(dim // heads, eps=1e-5)
             self.k_norm = nn.LayerNorm(dim // heads, eps=1e-5)
 
-    def __call__(self, x, rope=None, tabs=None, past=None):
-        """past: (K, V) of other tokens this attention also looks at (the K/V cache). Returns (out, (K, V))."""
+    def __call__(self, x, rope=None, tabs=None):
         b, n, c = x.shape
         h = self.heads
         qkv = self.qkv(x).reshape(b, n, 3, h, c // h).transpose(2, 0, 3, 1, 4)
@@ -111,11 +110,8 @@ class Attention(nn.Module):
             q, k = self.q_norm(q), self.k_norm(k)
         if rope is not None:
             q, k = rope(q, tabs), rope(k, tabs)
-        kv = (k, v)
-        if past is not None:
-            k, v = mx.concatenate([past[0], k], axis=2), mx.concatenate([past[1], v], axis=2)
         o = mx.fast.scaled_dot_product_attention(q, k, v, scale=(c // h) ** -0.5)
-        return self.proj(o.transpose(0, 2, 1, 3).reshape(b, n, c)), kv
+        return self.proj(o.transpose(0, 2, 1, 3).reshape(b, n, c))
 
 
 class Mlp(nn.Module):
@@ -138,10 +134,9 @@ class Block(nn.Module):
         self.ls1 = mx.ones((dim,))
         self.ls2 = mx.ones((dim,))
 
-    def __call__(self, x, rope=None, tabs=None, past=None):
-        a, kv = self.attn(self.norm1(x), rope, tabs, past)
-        x = x + self.ls1 * a
-        return x + self.ls2 * self.mlp(self.norm2(x)), kv
+    def __call__(self, x, rope=None, tabs=None):
+        x = x + self.ls1 * self.attn(self.norm1(x), rope, tabs)
+        return x + self.ls2 * self.mlp(self.norm2(x))
 
 
 class Backbone(nn.Module):
@@ -174,9 +169,9 @@ class Backbone(nn.Module):
         x = x.reshape(1, ph * pw, c)
         x = mx.concatenate([self.cls_token.astype(x.dtype), x], axis=1) + self.pos_tables(ph, pw)
         for blk in self.blocks[:self.cfg.alt_start - 1]:
-            x, _ = blk(x)
+            x = blk(x)
         before = x
-        x, _ = self.blocks[self.cfg.alt_start - 1](x)
+        x = self.blocks[self.cfg.alt_start - 1](x)
         return {"before": before, "x": x, "grid": (ph, pw)}
 
     def _tabs(self, i, ph, pw, S):
@@ -193,9 +188,9 @@ class Backbone(nn.Module):
         o = mx.concatenate([local_x, x], axis=-1)
         return mx.concatenate([o[..., :c], self.norm(o[..., c:])], axis=-1)[:, 1:], o[:, 0]
 
-    def cross(self, views: list, keep_kv: bool = False):
-        """The cross-view blocks over every view's early tokens. Returns ([(tokens S x N x 2C, camera S x 2C)] per
-        out layer in the views' own order, {global block: (K, V) over all views} if keep_kv)."""
+    def cross(self, views: list):
+        """The cross-view blocks over every view's early tokens: [(tokens S x N x 2C, camera S x 2C)] per out layer,
+        in the views' own order."""
         cfg = self.cfg
         S = len(views)
         ph, pw = views[0]["grid"]
@@ -208,7 +203,7 @@ class Backbone(nn.Module):
         inv = mx.array([order.index(j) for j in range(S)])
         local_x = x
         T = x.shape[1]
-        outs, kvs = [], {}
+        outs = []
         for i in range(cfg.alt_start, cfg.depth):
             blk = self.blocks[i]
             ltabs, gtabs = self._tabs(i, ph, pw, S)
@@ -219,42 +214,14 @@ class Backbone(nn.Module):
                 x = mx.concatenate([cam[0][:, None].astype(x.dtype), x[:, 1:]], axis=1)
                 local_x = x                             # DA3 writes the camera token in place, into local_x too
             if i % 2 == 1:
-                y, kv = blk(x.reshape(1, S * T, -1), rope, gtabs)
-                x = y.reshape(S, T, -1)
-                if keep_kv:
-                    kvs[i] = kv
+                x = blk(x.reshape(1, S * T, -1), rope, gtabs).reshape(S, T, -1)
             else:
-                x, _ = blk(x, rope, ltabs)
+                x = blk(x, rope, ltabs)
                 local_x = x
             if i in cfg.out_layers:
                 tok, cam = self._out(local_x, x)
                 outs.append((tok[inv], cam[inv]))
-        return outs, kvs
-
-    def extend(self, kvs: dict, view: dict):
-        """One more view through the cross-view blocks, attending to kept (K, V) of other views in the global
-        blocks; the kept views don't see it (they aren't recomputed). Returns [(tokens 1 x N x 2C, camera 1 x 2C)]."""
-        cfg = self.cfg
-        ph, pw = view["grid"]
-        x = view["x"]
-        local_x = x
-        outs = []
-        for i in range(cfg.alt_start, cfg.depth):
-            blk = self.blocks[i]
-            ltabs, gtabs = self._tabs(i, ph, pw, 1)
-            rope = self.rope if ltabs is not None else None
-            if i == cfg.alt_start:
-                x = mx.concatenate([self.camera_token[:, 1:].astype(x.dtype), x[:, 1:]], axis=1)
-                local_x = x
-            if i % 2 == 1:
-                x, _ = blk(x, rope, gtabs, past=kvs[i])
-            else:
-                x, _ = blk(x, rope, ltabs)
-                local_x = x
-            if i in cfg.out_layers:
-                outs.append(self._out(local_x, x))
         return outs
-
 
 # --------------------------------------------------------------------------------------------------------------------
 # head (DualDPT)
@@ -431,13 +398,8 @@ class MLXBackend:
         mx.eval(e["before"], e["x"])
         return e
 
-    def cross(self, views: list, keep_kv: bool):
-        outs, kvs = self.m.backbone.cross(views, keep_kv)
-        mx.eval(outs, kvs)
-        return outs, kvs
-
-    def extend(self, kvs: dict, view: dict):
-        outs = self.m.backbone.extend(kvs, view)
+    def cross(self, views: list):
+        outs = self.m.backbone.cross(views)
         mx.eval(outs)
         return outs
 
@@ -454,9 +416,3 @@ class MLXBackend:
     def pose_enc(self, outs) -> np.ndarray:
         enc = self.m.cam_dec(outs[-1][1].astype(mx.float32))
         return np.array(enc, dtype=np.float64)
-
-    @staticmethod
-    def concat(parts):
-        """Out-layer lists of several groups of views -> one list (views in the order given)."""
-        return [(mx.concatenate([p[i][0] for p in parts], 0), mx.concatenate([p[i][1] for p in parts], 0))
-                for i in range(len(parts[0]))]
