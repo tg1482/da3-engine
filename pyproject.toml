@@ -1,0 +1,11 @@
+[project]
+name = "da3-engine"
+version = "0.1.0"
+description = "Multi-view Depth Anything 3 for streaming: exact or K/V-cached, PyTorch or MLX"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+dependencies = ["mlx", "numpy", "safetensors", "opencv-python-headless"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]

@@ -1,0 +1,6 @@
+.venv/
+weights/
+ref/
+__pycache__/
+*.pyc
+*.egg-info/
